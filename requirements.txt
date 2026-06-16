@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-multipart
+transformers
+tree-sitter
+tree-sitter-java
+tree-sitter-c-sharp
+tree-sitter-python
