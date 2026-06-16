@@ -8,18 +8,18 @@ import zipfile
 import os
 import difflib
 from collections import defaultdict
-from itertools import combinations, groupby
+from itertools import combinations
 
 import tree_sitter_java as tsjava
 import tree_sitter_c_sharp as tscsharp
 import tree_sitter_python as tspy
 from tree_sitter import Language, Parser
+import shutil
+import tempfile
+from pathlib import Path
 
-
-# ---------------------------------------------------------------------------
-# 1. App (single instance)
-# ---------------------------------------------------------------------------
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,13 +27,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ADD THIS: A simple health check for the AWS Load Balancer
 @app.get("/")
 async def health_check():
     return {"status": "healthy", "message": "Plagiarism detector API is running"}
 
 
 # ---------------------------------------------------------------------------
-# 2. AST + IR
+# 1. AST Setup & IR Mapping
 # ---------------------------------------------------------------------------
 JAVA_LANGUAGE   = Language(tsjava.language())
 CSHARP_LANGUAGE = Language(tscsharp.language())
@@ -76,8 +77,8 @@ IR_MAP = {
     "array_access": "ARRAY_ACCESS", "element_access_expression": "ARRAY_ACCESS",
     "subscript": "ARRAY_ACCESS",
     "string_literal": "LIT_STRING", "string": "LIT_STRING",
-    "integer_literal": "LIT_INT",   "integer": "LIT_INT",
-    "real_literal": "LIT_FLOAT",    "float": "LIT_FLOAT",
+    "integer_literal": "LIT_INT", "integer": "LIT_INT",
+    "real_literal": "LIT_FLOAT", "float": "LIT_FLOAT",
     "boolean": "LIT_BOOL", "true": "LIT_BOOL", "false": "LIT_BOOL",
     "null_literal": "LIT_NULL", "none": "LIT_NULL",
     "import_statement": "IMPORT", "using_directive": "IMPORT",
@@ -86,9 +87,9 @@ IR_MAP = {
 
 
 def _traverse(node, tokens: list):
-    t = IR_MAP.get(node.type)
-    if t:
-        tokens.append(t)
+    token = IR_MAP.get(node.type)
+    if token:
+        tokens.append(token)
     for child in node.children:
         _traverse(child, tokens)
 
@@ -108,16 +109,26 @@ def get_ir(source_code: str, ext: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 3. Model
+# 2. Model Architecture
 # ---------------------------------------------------------------------------
 class SiameseVerifier(nn.Module):
     def __init__(self, emb_dim: int = 768, dropout_1: float = 0.3, dropout_2: float = 0.2):
         super().__init__()
+        fused_dim = emb_dim * 4 + 1
+
         self.mlp = nn.Sequential(
-            nn.Linear(emb_dim * 4 + 1, 512), nn.LayerNorm(512), nn.GELU(), nn.Dropout(dropout_1),
-            nn.Linear(512, 128),             nn.LayerNorm(128), nn.GELU(), nn.Dropout(dropout_2),
-            nn.Linear(128, 32),              nn.GELU(),
-            nn.Linear(32, 1),               nn.Sigmoid(),
+            nn.Linear(fused_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(dropout_1),
+            nn.Linear(512, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Dropout(dropout_2),
+            nn.Linear(128, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid(),
         )
 
     def forward(self, u, v, ir_sim):
@@ -127,8 +138,16 @@ class SiameseVerifier(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 4. Model + tokenizer init
+# 3. App Initialisation
 # ---------------------------------------------------------------------------
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 DEVICE    = "cuda" if torch.cuda.is_available() else "cpu"
 tokenizer = AutoTokenizer.from_pretrained("microsoft/unixcoder-base")
 unixcoder = AutoModel.from_pretrained("microsoft/unixcoder-base").to(DEVICE)
@@ -139,37 +158,45 @@ checkpoint = torch.load("siamese_best.pt", map_location=DEVICE)
 model.load_state_dict(checkpoint["model_state"])
 model.eval()
 
-
-# ---------------------------------------------------------------------------
-# 5. In-memory cache  (populated by /analyze)
-# ---------------------------------------------------------------------------
-_file_cache:  dict[str, str] = {}   # file path → source code
-_comparisons: list[dict]     = []   # all pairwise comparison results
+# In-memory stores populated on /analyze
+_file_cache:   dict[str, str]  = {}   # path -> source code
+_comparisons:  list[dict]      = []   # full comparison results
 
 
 # ---------------------------------------------------------------------------
-# 6. Core helpers
+# 4. Core helpers
 # ---------------------------------------------------------------------------
 def embed_code(source_code: str, ir_stream: str = "") -> torch.Tensor:
     text    = f"<IR> {ir_stream} </IR> <CODE> {source_code} </CODE>" if ir_stream else source_code
     encoded = tokenizer(
-        text, return_tensors="pt", max_length=512, truncation=True, padding="max_length"
+        text,
+        return_tensors="pt",
+        max_length=512,
+        truncation=True,
+        padding="max_length",
     ).to(DEVICE)
     with torch.no_grad():
         out = unixcoder(**encoded)
-    return F.normalize(out.last_hidden_state[:, 0, :], p=2, dim=1).squeeze().cpu()
+    cls_vec = out.last_hidden_state[:, 0, :]
+    return F.normalize(cls_vec, p=2, dim=1).squeeze().cpu()
 
 
 def compare_files(file_a: str, code_a: str, file_b: str, code_b: str) -> dict:
-    ext_a, ext_b = os.path.splitext(file_a)[1], os.path.splitext(file_b)[1]
-    ir_a, ir_b   = get_ir(code_a, ext_a), get_ir(code_b, ext_b)
+    ext_a = os.path.splitext(file_a)[1]
+    ext_b = os.path.splitext(file_b)[1]
 
-    ir_sim = (
-        difflib.SequenceMatcher(None, ir_a.split(), ir_b.split(), autojunk=False).ratio()
-        if ir_a and ir_b else 0.0
-    )
+    ir_a = get_ir(code_a, ext_a)
+    ir_b = get_ir(code_b, ext_b)
+
+    if ir_a and ir_b:
+        ir_sim = difflib.SequenceMatcher(
+            None, ir_a.split(), ir_b.split(), autojunk=False
+        ).ratio()
+    else:
+        ir_sim = 0.0
 
     ir_sim_tensor = torch.tensor([[ir_sim]], dtype=torch.float32).to(DEVICE)
+
     vec_a = embed_code(code_a, ir_a).to(DEVICE)
     vec_b = embed_code(code_b, ir_b).to(DEVICE)
 
@@ -177,14 +204,15 @@ def compare_files(file_a: str, code_a: str, file_b: str, code_b: str) -> dict:
         prob = model(vec_a.unsqueeze(0), vec_b.unsqueeze(0), ir_sim_tensor).item()
 
     combined = round((0.6 * prob + 0.4 * ir_sim) * 100, 2)
-    severity = "high" if combined >= 75 else "medium" if combined >= 50 else "low"
 
-    matcher = difflib.SequenceMatcher(None, code_a.splitlines(), code_b.splitlines(), autojunk=False)
+    matcher = difflib.SequenceMatcher(None, code_a.splitlines(), code_b.splitlines())
     matching_blocks = [
         {"a_start": m.a, "b_start": m.b, "size": m.size}
         for m in matcher.get_matching_blocks()
         if m.size > 2
     ]
+
+    severity = "high" if combined >= 75 else "medium" if combined >= 50 else "low"
 
     return {
         "file_a":                file_a,
@@ -202,19 +230,369 @@ def avg(values: list[float]) -> float:
     return round(sum(values) / len(values), 2) if values else 0.0
 
 
+# ---------------------------------------------------------------------------
+# 5. /analyze  — cross-folder (student vs student) comparison
+# ---------------------------------------------------------------------------
+# @app.post("/analyze")
+# async def analyze_zip(file: UploadFile = File(...)):
+#     global _file_cache, _comparisons
+#     _file_cache  = {}
+#     _comparisons = []
+
+#     # ── Extract ZIP ──────────────────────────────────────────────────────────
+#     tmp_path = f"temp_{file.filename}"
+#     with open(tmp_path, "wb+") as f:
+#         f.write(file.file.read())
+
+#     extracted: dict[str, str] = {}
+#     with zipfile.ZipFile(tmp_path, "r") as zf:
+#         for name in zf.namelist():
+#             if name.endswith((".java", ".py", ".cs")):
+#                 try:
+#                     extracted[name] = zf.read(name).decode("utf-8")
+#                 except UnicodeDecodeError:
+#                     extracted[name] = zf.read(name).decode("latin-1")
+#     os.remove(tmp_path)
+#     _file_cache = extracted
+
+#     # ── Group by top-level folder (one folder = one student) ─────────────────
+#     student_files: dict[str, dict[str, str]] = defaultdict(dict)
+#     for path, code in extracted.items():
+#         parts   = path.replace("\\", "/").split("/")
+#         student = parts[0] if len(parts) > 1 else "__root__"
+#         student_files[student][path] = code
+
+#     students = list(student_files.keys())
+
+#     # ── Cross-folder comparison: every student pair, all files vs all files ───
+#     comparisons = []
+
+#     for student_a, student_b in combinations(students, 2):
+#         files_a = student_files[student_a]
+#         files_b = student_files[student_b]
+#         pairs: list[dict] = []
+
+#         for fa, code_a in files_a.items():
+#             for fb, code_b in files_b.items():
+#                 pairs.append(compare_files(fa, code_a, fb, code_b))
+
+#         pairs.sort(key=lambda r: r["combined_score"], reverse=True)
+#         scores = [p["combined_score"] for p in pairs]
+
+#         comparisons.append({
+#             "student_a":     student_a,
+#             "student_b":     student_b,
+#             "files_a":       list(files_a.keys()),
+#             "files_b":       list(files_b.keys()),
+#             "avg_score":     avg(scores),
+#             "max_score":     max(scores) if scores else 0.0,
+#             "flagged_count": sum(1 for p in pairs if p["flagged"]),
+#             "pairs":         pairs,
+#         })
+
+#     comparisons.sort(key=lambda c: c["max_score"], reverse=True)
+#     _comparisons = comparisons
+
+#     # ── Per-student risk summary ──────────────────────────────────────────────
+#     student_summary: dict[str, dict] = {}
+#     for s in students:
+#         relevant_scores = [
+#             p["combined_score"]
+#             for comp in comparisons
+#             if comp["student_a"] == s or comp["student_b"] == s
+#             for p in comp["pairs"]
+#         ]
+#         student_summary[s] = {
+#             "files":     list(student_files[s].keys()),
+#             "max_score": max(relevant_scores) if relevant_scores else 0.0,
+#             "avg_score": avg(relevant_scores),
+#             "flagged":   any(s >= 55 for s in relevant_scores),
+#         }
+
+#     return {
+#         "status":      "success",
+#         "students":    student_summary,
+#         "comparisons": comparisons,
+#     }
+
+# ---------------------------------------------------------------------------
+# 5. /analyze  — cross-folder (student vs student) comparison
+# ---------------------------------------------------------------------------
+@app.post("/analyze")
+async def analyze_zip(file: UploadFile = File(...)):
+    global _file_cache, _comparisons
+    _file_cache  = {}
+    _comparisons = []
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # 1. Save uploaded master ZIP
+        root_zip_path = os.path.join(tmp_dir, "uploaded.zip")
+        with open(root_zip_path, "wb+") as f:
+            f.write(await file.read())
+
+        # 2. Extract master ZIP
+        extract_base = os.path.join(tmp_dir, "extracted")
+        os.makedirs(extract_base, exist_ok=True)
+        with zipfile.ZipFile(root_zip_path, 'r') as zf:
+            zf.extractall(extract_base)
+        os.remove(root_zip_path)
+
+        # 3. Recursively extract nested ZIPs (unwraps mediconnectapp.zip, etc.)
+        while True:
+            found_zip = False
+            for root, dirs, files in os.walk(extract_base):
+                for f_name in files:
+                    if f_name.lower().endswith('.zip'):
+                        found_zip = True
+                        zip_path = os.path.join(root, f_name)
+                        # Extract into a folder named after the zip file (minus .zip)
+                        target_dir = os.path.join(root, f_name[:-4])
+                        os.makedirs(target_dir, exist_ok=True)
+                        try:
+                            with zipfile.ZipFile(zip_path, 'r') as z:
+                                z.extractall(target_dir)
+                        except zipfile.BadZipFile:
+                            pass # Skip corrupt zips
+                        os.remove(zip_path)
+            if not found_zip:
+                break # All nested zips are fully unwrapped
+
+        # 4. Find all target source files
+        source_files = []
+        for root, dirs, files in os.walk(extract_base):
+            for f_name in files:
+                if f_name.endswith((".java", ".py", ".cs")):
+                    # Normalize slashes
+                    source_files.append(os.path.join(root, f_name).replace("\\", "/"))
+
+        if not source_files:
+            return {"status": "error", "message": "No valid .cs, .java, or .py files found after deep extraction."}
+
+        # 5. Determine the common directory prefix to strip wrapper folders
+        # This cuts out "Submissions/Submissions/" so we get to the real student folders.
+        common_prefix = os.path.commonpath(source_files).replace("\\", "/")
+        if os.path.isfile(common_prefix):
+            common_prefix = os.path.dirname(common_prefix)
+        if not common_prefix.endswith("/"):
+            common_prefix += "/"
+
+        # 6. Read files and group by student
+        extracted = {}
+        student_files: dict[str, dict[str, str]] = defaultdict(dict)
+
+        for file_path in source_files:
+            # Read code
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    code = f.read()
+            except UnicodeDecodeError:
+                with open(file_path, "r", encoding="latin-1") as f:
+                    code = f.read()
+
+            # The clean path to display in the UI (removes all the temp dir absolute paths)
+            display_path = file_path.replace(extract_base, "").lstrip("/")
+
+            # Determine student name by looking at the first folder AFTER the common prefix
+            relative_path = file_path[len(common_prefix):]
+            parts = relative_path.split("/")
+            
+            # If parts[0] is just the file name, it means the files were loose. 
+            # Otherwise, the first folder name is the student name.
+            student_name = parts[0] if len(parts) > 1 else "__root__"
+
+            extracted[display_path] = code
+            student_files[student_name][display_path] = code
+
+    _file_cache = extracted
+    students = list(student_files.keys())
+
+    # ── Cross-folder comparison: every student pair, all files vs all files ───
+    comparisons = []
+
+    for student_a, student_b in combinations(students, 2):
+        files_a = student_files[student_a]
+        files_b = student_files[student_b]
+        pairs: list[dict] = []
+
+        for fa, code_a in files_a.items():
+            for fb, code_b in files_b.items():
+                pairs.append(compare_files(fa, code_a, fb, code_b))
+
+        # Only add to comparisons if there are valid pairs
+        if pairs:
+            pairs.sort(key=lambda r: r["combined_score"], reverse=True)
+            scores = [p["combined_score"] for p in pairs]
+
+            comparisons.append({
+                "student_a":     student_a,
+                "student_b":     student_b,
+                "files_a":       list(files_a.keys()),
+                "files_b":       list(files_b.keys()),
+                "avg_score":     avg(scores),
+                "max_score":     max(scores) if scores else 0.0,
+                "flagged_count": sum(1 for p in pairs if p["flagged"]),
+                "pairs":         pairs,
+            })
+
+    comparisons.sort(key=lambda c: c["max_score"], reverse=True)
+    _comparisons = comparisons
+
+    # ── Per-student risk summary ──────────────────────────────────────────────
+    student_summary: dict[str, dict] = {}
+    for s in students:
+        relevant_scores = [
+            p["combined_score"]
+            for comp in comparisons
+            if comp["student_a"] == s or comp["student_b"] == s
+            for p in comp["pairs"]
+        ]
+        student_summary[s] = {
+            "files":     list(student_files[s].keys()),
+            "max_score": max(relevant_scores) if relevant_scores else 0.0,
+            "avg_score": avg(relevant_scores),
+            "flagged":   any(score >= 55 for score in relevant_scores),
+        }
+
+    return {
+        "status":      "success",
+        "students":    student_summary,
+        "comparisons": comparisons,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6. /file  — serve cached source on demand
+# ---------------------------------------------------------------------------
+@app.get("/file")
+async def get_file(name: str):
+    code = _file_cache.get(name)
+    if code is None:
+        raise HTTPException(
+            status_code=404,
+            detail="File not found in cache. Re-run /analyze first.",
+        )
+    return {"name": name, "code": code}
+
+
+# ---------------------------------------------------------------------------
+# 7. /file-matches  — per-line plagiarism annotations for the viewer
+#
+#    Returns every line range in `file` (belonging to `student`) that was
+#    found to match lines in another student's file, together with who copied
+#    it, which file, and the pair-level scores.
+#
+#    Response shape:
+#    {
+#      "file": str,
+#      "student": str,
+#      "code": str,
+#      "matches": [
+#        {
+#          "a_start": int,   # 0-based line index in THIS file
+#          "a_end":   int,   # inclusive
+#          "b_start": int,   # 0-based line index in the OTHER file
+#          "b_end":   int,   # inclusive
+#          "other_student": str,
+#          "other_file":    str,
+#          "combined_score":        float,
+#          "model_confidence":      float,
+#          "structural_similarity": float,
+#          "severity": str,
+#        },
+#        ...
+#      ]
+#    }
+# ---------------------------------------------------------------------------
+@app.get("/file-matches")
+async def get_file_matches(student: str, file: str):
+    code = _file_cache.get(file)
+    if code is None:
+        raise HTTPException(
+            status_code=404,
+            detail="File not found in cache. Re-run /analyze first.",
+        )
+
+    matches: list[dict] = []
+
+    for comp in _comparisons:
+        # Determine whether `file` belongs to student_a or student_b in this comparison
+        if comp["student_a"] == student and file in comp["files_a"]:
+            role        = "a"
+            other_student = comp["student_b"]
+        elif comp["student_b"] == student and file in comp["files_b"]:
+            role        = "b"
+            other_student = comp["student_a"]
+        else:
+            continue
+
+        for pair in comp["pairs"]:
+            # Only pick pairs that involve our specific file
+            if role == "a" and pair["file_a"] != file:
+                continue
+            if role == "b" and pair["file_b"] != file:
+                continue
+
+            other_file = pair["file_b"] if role == "a" else pair["file_a"]
+
+            for block in pair["matching_blocks"]:
+                if block["size"] == 0:
+                    continue
+
+                # Map block indices to the perspective of `file`
+                if role == "a":
+                    a_start = block["a_start"]
+                    b_start = block["b_start"]
+                else:
+                    a_start = block["b_start"]
+                    b_start = block["a_start"]
+
+                a_end = a_start + block["size"] - 1
+                b_end = b_start + block["size"] - 1
+
+                matches.append({
+                    "a_start":              a_start,
+                    "a_end":                a_end,
+                    "b_start":              b_start,
+                    "b_end":                b_end,
+                    "other_student":        other_student,
+                    "other_file":           other_file,
+                    "combined_score":       pair["combined_score"],
+                    "model_confidence":     pair["model_confidence"],
+                    "structural_similarity": pair["structural_similarity"],
+                    "severity":             pair["severity"],
+                })
+
+    # Merge overlapping ranges from the same other_student+other_file pair
+    # so the frontend receives clean, non-redundant annotations.
+    matches = _merge_overlapping(matches)
+
+    return {
+        "file":    file,
+        "student": student,
+        "code":    code,
+        "matches": matches,
+    }
+
+
 def _merge_overlapping(matches: list[dict]) -> list[dict]:
-    """Merge adjacent/overlapping line ranges per (other_student, other_file) pair."""
+    """
+    For each (other_student, other_file) group, merge line ranges that
+    overlap or are adjacent so the frontend gets clean spans to highlight.
+    """
+    from itertools import groupby
+
     key_fn = lambda m: (m["other_student"], m["other_file"])
     sorted_matches = sorted(matches, key=key_fn)
     merged: list[dict] = []
 
-    for _, group in groupby(sorted_matches, key=key_fn):
-        items   = sorted(group, key=lambda m: m["a_start"])
+    for (other_student, other_file), group in groupby(sorted_matches, key=key_fn):
+        items = sorted(group, key=lambda m: m["a_start"])
         current = None
         for item in items:
             if current is None:
                 current = dict(item)
             elif item["a_start"] <= current["a_end"] + 1:
+                # Extend the current range; keep the highest score
                 current["a_end"] = max(current["a_end"], item["a_end"])
                 current["b_end"] = max(current["b_end"], item["b_end"])
                 if item["combined_score"] > current["combined_score"]:
@@ -229,155 +607,3 @@ def _merge_overlapping(matches: list[dict]) -> list[dict]:
             merged.append(current)
 
     return sorted(merged, key=lambda m: m["a_start"])
-
-
-# ---------------------------------------------------------------------------
-# 7. /analyze
-# ---------------------------------------------------------------------------
-@app.post("/analyze")
-async def analyze_zip(file: UploadFile = File(...)):
-    global _file_cache, _comparisons
-    _file_cache  = {}
-    _comparisons = []
-
-    tmp_path = f"temp_{file.filename}"
-    with open(tmp_path, "wb+") as f:
-        f.write(file.file.read())
-
-    extracted: dict[str, str] = {}
-    with zipfile.ZipFile(tmp_path, "r") as zf:
-        for name in zf.namelist():
-            if name.endswith((".java", ".py", ".cs")):
-                try:    extracted[name] = zf.read(name).decode("utf-8")
-                except: extracted[name] = zf.read(name).decode("latin-1")
-    os.remove(tmp_path)
-    _file_cache = extracted
-
-    # Group by top-level folder = student
-    student_files: dict[str, dict[str, str]] = defaultdict(dict)
-    for path, code in extracted.items():
-        parts   = path.replace("\\", "/").split("/")
-        student = parts[0] if len(parts) > 1 else "__root__"
-        student_files[student][path] = code
-
-    students = list(student_files.keys())
-
-    # Cross-student comparison
-    comparisons: list[dict] = []
-    for student_a, student_b in combinations(students, 2):
-        files_a = student_files[student_a]
-        files_b = student_files[student_b]
-        pairs: list[dict] = []
-
-        for fa, code_a in files_a.items():
-            for fb, code_b in files_b.items():
-                pairs.append(compare_files(fa, code_a, fb, code_b))
-
-        pairs.sort(key=lambda r: r["combined_score"], reverse=True)
-        scores = [p["combined_score"] for p in pairs]
-
-        comparisons.append({
-            "student_a":     student_a,
-            "student_b":     student_b,
-            "files_a":       list(files_a.keys()),
-            "files_b":       list(files_b.keys()),
-            "avg_score":     avg(scores),
-            "max_score":     max(scores) if scores else 0.0,
-            "flagged_count": sum(1 for p in pairs if p["flagged"]),
-            "pairs":         pairs,
-        })
-
-    comparisons.sort(key=lambda c: c["max_score"], reverse=True)
-    _comparisons = comparisons
-
-    # Per-student summary
-    student_summary: dict[str, dict] = {}
-    for s in students:
-        relevant_scores = [
-            p["combined_score"]
-            for comp in comparisons
-            if comp["student_a"] == s or comp["student_b"] == s
-            for p in comp["pairs"]
-        ]
-        student_summary[s] = {
-            "files":     list(student_files[s].keys()),
-            "max_score": max(relevant_scores) if relevant_scores else 0.0,
-            "avg_score": avg(relevant_scores),
-            "flagged":   any(sc >= 55 for sc in relevant_scores),
-        }
-
-    return {
-        "status":      "success",
-        "students":    student_summary,
-        "comparisons": comparisons,
-    }
-
-
-# ---------------------------------------------------------------------------
-# 8. /file
-# ---------------------------------------------------------------------------
-@app.get("/file")
-async def get_file(name: str):
-    code = _file_cache.get(name)
-    if code is None:
-        raise HTTPException(404, "File not found in cache. Re-run /analyze first.")
-    return {"name": name, "code": code}
-
-
-# ---------------------------------------------------------------------------
-# 9. /file-matches
-# ---------------------------------------------------------------------------
-@app.get("/file-matches")
-async def get_file_matches(student: str, file: str):
-    code = _file_cache.get(file)
-    if code is None:
-        raise HTTPException(404, "File not found in cache. Re-run /analyze first.")
-
-    matches: list[dict] = []
-
-    for comp in _comparisons:
-        if comp["student_a"] == student and file in comp["files_a"]:
-            role          = "a"
-            other_student = comp["student_b"]
-        elif comp["student_b"] == student and file in comp["files_b"]:
-            role          = "b"
-            other_student = comp["student_a"]
-        else:
-            continue
-
-        for pair in comp["pairs"]:
-            if role == "a" and pair["file_a"] != file:
-                continue
-            if role == "b" and pair["file_b"] != file:
-                continue
-
-            other_file = pair["file_b"] if role == "a" else pair["file_a"]
-
-            for block in pair["matching_blocks"]:
-                if block["size"] == 0:
-                    continue
-
-                a_start = block["a_start"] if role == "a" else block["b_start"]
-                b_start = block["b_start"] if role == "a" else block["a_start"]
-                a_end   = a_start + block["size"] - 1
-                b_end   = b_start + block["size"] - 1
-
-                matches.append({
-                    "a_start":               a_start,
-                    "a_end":                 a_end,
-                    "b_start":               b_start,
-                    "b_end":                 b_end,
-                    "other_student":         other_student,
-                    "other_file":            other_file,
-                    "combined_score":        pair["combined_score"],
-                    "model_confidence":      pair["model_confidence"],
-                    "structural_similarity": pair["structural_similarity"],
-                    "severity":              pair["severity"],
-                })
-
-    return {
-        "file":    file,
-        "student": student,
-        "code":    code,
-        "matches": _merge_overlapping(matches),
-    }
